@@ -1,6 +1,7 @@
 import torch
-from attention import MultiHeadAttention
 from torch import nn
+
+from .attention import MultiHeadAttention
 
 
 class PositionalEncoding(nn.Module):

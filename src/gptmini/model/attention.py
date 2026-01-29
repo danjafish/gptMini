@@ -65,16 +65,47 @@ class MultiHeadAttention(nn.Module):
         self.dropout = dropout
         self.output_projection = nn.Linear(feature_dim, input_dim)
 
-    def forward(self, data: torch.Tensor, context: torch.Tensor, pe: nn.Module = None, attn_mask=None):
+    def forward(
+        self,
+        data: torch.Tensor,
+        context: torch.Tensor,
+        pe: nn.Module = None,
+        attn_mask=None,
+        kv_cache=None,
+    ):
+        """
+
+        :param data:
+        :param context:
+        :param pe:
+        :param attn_mask:
+        :param kv_cache: (past_k, past_v): 2, B, S2, H, head_dim
+        :return: Z, optional - kv_cache
+        """
         B, S1 = data.shape[0], data.shape[-2]
         S2 = context.shape[-2]
-
-        Q = self.q_projection(data)
-
-        K = self.k_projection(context)
-        V = self.v_projection(context)
         H = self.n_heads
 
+        Q = self.q_projection(data)
+        if kv_cache is None:
+            K = self.k_projection(context)
+            V = self.v_projection(context)
+        else:
+            # we only need to compute one token and update K and V
+            last_token = context[:, -1].view(B, 1, -1)
+            k = self.k_projection(last_token)
+            v = self.v_projection(last_token)
+
+            if pe is not None:
+                Q, K = pe(Q, K)
+
+            k_cache = kv_cache[0].view(B, S2, -1)  # transfer to same shape as k/v
+            v_cache = kv_cache[1].view(B, S2, -1)
+
+            K = torch.cat([k_cache, k], dim=1)
+            V = torch.cat([v_cache, v], dim=1)
+
+        # print(Q.shape, B, S1, H, self.head_dim)
         Q = Q.view(B, S1, H, self.head_dim).transpose(1, 2)
 
         K = K.view(B, S2, H, self.head_dim).transpose(1, 2)
@@ -100,4 +131,4 @@ class MultiHeadAttention(nn.Module):
         Z = Z.view(B, S1, -1)
         Z = self.output_projection(Z)
 
-        return Z
+        return Z, (K, V)
