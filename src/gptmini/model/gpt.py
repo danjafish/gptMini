@@ -66,59 +66,81 @@ class GPTmini(nn.Module):
             nn.Linear(input_dim, vocab_len),
         )
 
-    def forward(self, x: torch.Tensor, attn_mask=None):
+    def forward(
+        self, x: torch.Tensor, attn_mask=None, return_cache=False, past_kv_list=None
+    ):
         # embedding
         # print('Shape before embedding: ', x.shape)
         x = self.token_embedding(x)
         # print('Shape after embedding: ', x.shape)
 
         if self.emb_type in ["learned", "fourier"]:
-            pe_emb = self.pe(x, x.size(1))
+            pe_emb = self.pe(x)
             x = x + pe_emb
             pe = None
         else:
             pe = self.pe
+        if return_cache and past_kv_list is None:
+            past_kv_list = [None for _ in range(len(self.decoder_layers))]
 
-        for layer in self.decoder_layers:
-            x = layer(x, pe, attn_mask)
+        for i, layer in enumerate(self.decoder_layers):
+            if return_cache:
+                x, present_kv = layer(
+                    x, pe, attn_mask, past_kv=past_kv_list[i], return_cache=return_cache
+                )
+                past_kv_list[i] = present_kv
+            else:
+                x = layer(x, pe, attn_mask)
 
         x = self.norm(x)
         out = self.gpt_head(x)
-        return out
+        if return_cache:
+            return out, past_kv_list
+        else:
+            return out
 
-    def genereate(self, prompt, max_steps=100, strategy="greedy", t=0.0, eos_token=0):
-        """
-        Generation function
-
-        :param prompt: Tensor, shape B, S - tokens
-        :param max_steps: max steps to generate
-        :param strategy: strategy to use for generation
-        :param t: temperature
-
-        :return: B, M - generated sequence
-        """
+    def generate(
+        self, prompt, max_steps=100, strategy="greedy", t=1.0, top_k=50, eos_token=0
+    ):
         self.eval()
         with torch.no_grad():
             B = prompt.size(0)
             is_finished = torch.zeros((B, 1), device=prompt.device, dtype=torch.bool)
             generated = prompt.clone()
 
-            if strategy == "greedy":
-                for step in range(max_steps):
-                    logits = self.forward(generated)  # B, S, vocab_size
+            # prime cache with the whole prompt
+            logits, present_kv_list = self.forward(
+                generated, past_kv_list=None, return_cache=True
+            )
 
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(
-                        1
-                    )  # pick last token, and argmax -> B, 1
-                    is_finished = is_finished | (next_token == eos_token)
+            for step in range(max_steps):
+                last_logits = logits[:, -1, :]  # (B, V)
 
-                    next_token[is_finished] = eos_token
+                if strategy == "greedy":
+                    next_token = torch.argmax(last_logits, dim=-1, keepdim=True)
 
-                    generated = torch.cat([generated, next_token], dim=1)
+                elif strategy == "topk":
+                    temp = 1.0 if (t is None or t <= 0.0) else float(t)
+                    last_logits = last_logits / temp
 
-                    if is_finished.all():
-                        break
-            else:
-                raise RuntimeError("only greedy strategy is implemented for now")
+                    k = min(int(top_k), last_logits.size(-1))
+                    topv, topi = torch.topk(last_logits, k, dim=-1)  # (B, k), (B, k)
+                    probs = torch.softmax(topv, dim=-1)  # (B, k)
+                    sample_idx = torch.multinomial(probs, num_samples=1)  # (B, 1)
+                    next_token = topi.gather(-1, sample_idx)  # (B, 1)
+
+                else:
+                    raise RuntimeError("strategy must be 'greedy' or 'topk'")
+
+                is_finished = is_finished | (next_token == eos_token)
+                next_token[is_finished] = eos_token
+
+                generated = torch.cat([generated, next_token], dim=1)
+                if is_finished.all():
+                    break
+
+                logits, present_kv_list = self.forward(
+                    next_token, past_kv_list=present_kv_list, return_cache=True
+                )
 
             return generated

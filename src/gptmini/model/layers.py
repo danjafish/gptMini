@@ -174,9 +174,24 @@ class TransformerBlock(nn.Module):
         self.pre_norm = nn.LayerNorm(input_dim)
         self.post_norm = nn.LayerNorm(input_dim)
 
-    def forward(self, x, pe=None, attn_mask=None):
+    def forward(self, x, pe=None, attn_mask=None, past_kv=None, return_cache=False):
+        attn_out = self.mha(
+            self.pre_norm(x),
+            self.pre_norm(x),
+            pe,
+            attn_mask,
+            kv_cache=past_kv,
+            return_cache=return_cache,
+        )
+        if return_cache:
+            out, present_kv = attn_out
+            x = x + out
+        else:
+            x = x + attn_out
 
-        x = x + self.mha(self.pre_norm(x), self.pre_norm(x), pe, attn_mask)
         x = x + self.ffn(self.post_norm(x))
 
-        return x
+        if return_cache:
+            return x, present_kv
+        else:
+            return x
